@@ -1,6 +1,7 @@
 import { factory } from '../utils/factory.js'
 import { isAccessorNode, isConstantNode, isFunctionNode, isOperatorNode, isSymbolNode, rule2Node } from '../utils/is.js'
 import { deepMap } from '../utils/collection.js'
+import { safeNumberType } from '../utils/number.js'
 import { hasOwnProperty } from '../utils/object.js'
 
 const name = 'parse'
@@ -184,6 +185,19 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
     'NaN',
     'Infinity'
   ]
+
+  const ESCAPE_CHARACTERS = {
+    '"': '"',
+    "'": "'",
+    '\\': '\\',
+    '/': '/',
+    b: '\b',
+    f: '\f',
+    n: '\n',
+    r: '\r',
+    t: '\t'
+    // note that \u is handled separately in parseStringToken()
+  }
 
   function initialState () {
     return {
@@ -987,7 +1001,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
   function parseAddSubtract (state) {
     let node, name, fn, params
 
-    node = parseMultiplyDivide(state)
+    node = parseMultiplyDivideModulusPercentage(state)
 
     const operators = {
       '+': 'add',
@@ -998,7 +1012,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
       fn = operators[name]
 
       getTokenSkipNewline(state)
-      const rightNode = parseMultiplyDivide(state)
+      const rightNode = parseMultiplyDivideModulusPercentage(state)
       if (rightNode.isPercentage) {
         params = [node, new OperatorNode('*', 'multiply', [node, rightNode])]
       } else {
@@ -1011,11 +1025,11 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
   }
 
   /**
-   * multiply, divide, modulus
+   * multiply, divide, modulus, percentage
    * @return {Node} node
    * @private
    */
-  function parseMultiplyDivide (state) {
+  function parseMultiplyDivideModulusPercentage (state) {
     let node, last, name, fn
 
     node = parseImplicitMultiplication(state)
@@ -1025,7 +1039,9 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
       '*': 'multiply',
       '.*': 'dotMultiply',
       '/': 'divide',
-      './': 'dotDivide'
+      './': 'dotDivide',
+      '%': 'mod',
+      mod: 'mod'
     }
 
     while (true) {
@@ -1036,8 +1052,22 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
 
         getTokenSkipNewline(state)
 
-        last = parseImplicitMultiplication(state)
-        node = new OperatorNode(name, fn, [node, last])
+        if (name === '%' && state.tokenType === TOKENTYPE.DELIMITER && state.token !== '(') {
+          // If the expression contains only %, then treat that as /100
+          if (state.token !== '' && operators[state.token]) {
+            const left = new OperatorNode('/', 'divide', [node, new ConstantNode(100)], false, true)
+            name = state.token
+            fn = operators[name]
+            getTokenSkipNewline(state)
+            last = parseImplicitMultiplication(state)
+
+            node = new OperatorNode(name, fn, [left, last])
+          } else { node = new OperatorNode('/', 'divide', [node, new ConstantNode(100)], false, true) }
+          // return node
+        } else {
+          last = parseImplicitMultiplication(state)
+          node = new OperatorNode(name, fn, [node, last])
+        }
       } else {
         break
       }
@@ -1060,6 +1090,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
     while (true) {
       if ((state.tokenType === TOKENTYPE.SYMBOL) ||
           (state.token === 'in' && isConstantNode(node)) ||
+          (state.token === 'in' && isOperatorNode(node) && node.fn === 'unaryMinus' && isConstantNode(node.args[0])) ||
           (state.tokenType === TOKENTYPE.NUMBER &&
               !isConstantNode(last) &&
               (!isOperatorNode(last) || last.op === '!')) ||
@@ -1089,7 +1120,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
    * @private
    */
   function parseRule2 (state) {
-    let node = parsePercentage(state)
+    let node = parseUnary(state)
     let last = node
     const tokenStates = []
 
@@ -1107,12 +1138,12 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
           getTokenSkipNewline(state)
 
           // Match the "symbol" part of the pattern, or a left parenthesis
-          if (state.tokenType === TOKENTYPE.SYMBOL || state.token === '(') {
+          if (state.tokenType === TOKENTYPE.SYMBOL || state.token === '(' || state.token === 'in') {
             // We've matched the pattern "number / number symbol".
             // Rewind once and build the "number / number" node; the symbol will be consumed later
             Object.assign(state, tokenStates.pop())
             tokenStates.pop()
-            last = parsePercentage(state)
+            last = parseUnary(state)
             node = new OperatorNode('/', 'divide', [node, last])
           } else {
             // Not a match, so rewind
@@ -1127,38 +1158,6 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
         }
       } else {
         break
-      }
-    }
-
-    return node
-  }
-
-  /**
-   * percentage or mod
-   * @return {Node} node
-   * @private
-   */
-  function parsePercentage (state) {
-    let node, name, fn, params
-
-    node = parseUnary(state)
-
-    const operators = {
-      '%': 'mod',
-      mod: 'mod'
-    }
-    while (hasOwnProperty(operators, state.token)) {
-      name = state.token
-      fn = operators[name]
-
-      getTokenSkipNewline(state)
-
-      if (name === '%' && state.tokenType === TOKENTYPE.DELIMITER && state.token !== '(') {
-        // If the expression contains only %, then treat that as /100
-        node = new OperatorNode('/', 'divide', [node, new ConstantNode(100)], false, true)
-      } else {
-        params = [node, parseUnary(state)]
-        node = new OperatorNode(name, fn, params)
       }
     }
 
@@ -1328,7 +1327,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
 
       if (hasOwnProperty(CONSTANTS, name)) { // true, false, null, ...
         node = new ConstantNode(CONSTANTS[name])
-      } else if (NUMERIC_CONSTANTS.indexOf(name) !== -1) { // NaN, Infinity
+      } else if (NUMERIC_CONSTANTS.includes(name)) { // NaN, Infinity
         node = new ConstantNode(numeric(name, 'number'))
       } else {
         node = new SymbolNode(name)
@@ -1339,7 +1338,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
       return node
     }
 
-    return parseDoubleQuotesString(state)
+    return parseString(state)
   }
 
   /**
@@ -1360,7 +1359,7 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
     let params
 
     while ((state.token === '(' || state.token === '[' || state.token === '.') &&
-        (!types || types.indexOf(state.token) !== -1)) { // eslint-disable-line no-unmodified-loop-condition
+        (!types || types.includes(state.token))) { // eslint-disable-line no-unmodified-loop-condition
       params = []
 
       if (state.token === '(') {
@@ -1418,9 +1417,12 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
         // dot notation like variable.prop
         getToken(state)
 
-        if (state.tokenType !== TOKENTYPE.SYMBOL) {
+        const isPropertyName = state.tokenType === TOKENTYPE.SYMBOL ||
+          (state.tokenType === TOKENTYPE.DELIMITER && state.token in NAMED_DELIMITERS)
+        if (!isPropertyName) {
           throw createSyntaxError(state, 'Property name expected after dot')
         }
+
         params.push(new ConstantNode(state.token))
         getToken(state)
 
@@ -1433,66 +1435,15 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
   }
 
   /**
-   * Parse a double quotes string.
+   * Parse a single or double quoted string.
    * @return {Node} node
    * @private
    */
-  function parseDoubleQuotesString (state) {
+  function parseString (state) {
     let node, str
 
-    if (state.token === '"') {
-      str = parseDoubleQuotesStringToken(state)
-
-      // create constant
-      node = new ConstantNode(str)
-
-      // parse index parameters
-      node = parseAccessors(state, node)
-
-      return node
-    }
-
-    return parseSingleQuotesString(state)
-  }
-
-  /**
-   * Parse a string surrounded by double quotes "..."
-   * @return {string}
-   */
-  function parseDoubleQuotesStringToken (state) {
-    let str = ''
-
-    while (currentCharacter(state) !== '' && currentCharacter(state) !== '"') {
-      if (currentCharacter(state) === '\\') {
-        // escape character, immediately process the next
-        // character to prevent stopping at a next '\"'
-        str += currentCharacter(state)
-        next(state)
-      }
-
-      str += currentCharacter(state)
-      next(state)
-    }
-
-    getToken(state)
-    if (state.token !== '"') {
-      throw createSyntaxError(state, 'End of string " expected')
-    }
-    getToken(state)
-
-    return JSON.parse('"' + str + '"') // unescape escaped characters
-  }
-
-  /**
-   * Parse a single quotes string.
-   * @return {Node} node
-   * @private
-   */
-  function parseSingleQuotesString (state) {
-    let node, str
-
-    if (state.token === '\'') {
-      str = parseSingleQuotesStringToken(state)
+    if (state.token === '"' || state.token === "'") {
+      str = parseStringToken(state, state.token)
 
       // create constant
       node = new ConstantNode(str)
@@ -1507,31 +1458,50 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
   }
 
   /**
-   * Parse a string surrounded by single quotes '...'
+   * Parse a string surrounded by single or double quotes
+   * @param {Object} state
+   * @param {"'" | "\""} quote
    * @return {string}
    */
-  function parseSingleQuotesStringToken (state) {
+  function parseStringToken (state, quote) {
     let str = ''
 
-    while (currentCharacter(state) !== '' && currentCharacter(state) !== '\'') {
+    while (currentCharacter(state) !== '' && currentCharacter(state) !== quote) {
       if (currentCharacter(state) === '\\') {
-        // escape character, immediately process the next
-        // character to prevent stopping at a next '\''
+        next(state)
+
+        const char = currentCharacter(state)
+        const escapeChar = ESCAPE_CHARACTERS[char]
+        if (escapeChar !== undefined) {
+          // an escaped control character like \" or \n
+          str += escapeChar
+          state.index += 1
+        } else if (char === 'u') {
+          // escaped unicode character
+          const unicode = state.expression.slice(state.index + 1, state.index + 5)
+          if (/^[0-9A-Fa-f]{4}$/.test(unicode)) { // test whether the string holds four hexadecimal values
+            str += String.fromCharCode(parseInt(unicode, 16))
+            state.index += 5
+          } else {
+            throw createSyntaxError(state, `Invalid unicode character \\u${unicode}`)
+          }
+        } else {
+          throw createSyntaxError(state, `Bad escape character \\${char}`)
+        }
+      } else {
+        // any regular character
         str += currentCharacter(state)
         next(state)
       }
-
-      str += currentCharacter(state)
-      next(state)
     }
 
     getToken(state)
-    if (state.token !== '\'') {
-      throw createSyntaxError(state, 'End of string \' expected')
+    if (state.token !== quote) {
+      throw createSyntaxError(state, `End of string ${quote} expected`)
     }
     getToken(state)
 
-    return JSON.parse('"' + str + '"') // unescape escaped characters
+    return str
   }
 
   /**
@@ -1560,8 +1530,10 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
           while (state.token === ';') { // eslint-disable-line no-unmodified-loop-condition
             getToken(state)
 
-            params[rows] = parseRow(state)
-            rows++
+            if (state.token !== ']') {
+              params[rows] = parseRow(state)
+              rows++
+            }
           }
 
           if (state.token !== ']') {
@@ -1615,8 +1587,10 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
       getToken(state)
 
       // parse expression
-      params[len] = parseAssignment(state)
-      len++
+      if (state.token !== ']' && state.token !== ';') {
+        params[len] = parseAssignment(state)
+        len++
+      }
     }
 
     return new ArrayNode(params)
@@ -1638,10 +1612,8 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
 
         if (state.token !== '}') {
           // parse key
-          if (state.token === '"') {
-            key = parseDoubleQuotesStringToken(state)
-          } else if (state.token === '\'') {
-            key = parseSingleQuotesStringToken(state)
+          if (state.token === '"' || state.token === "'") {
+            key = parseStringToken(state, state.token)
           } else if (state.tokenType === TOKENTYPE.SYMBOL || (state.tokenType === TOKENTYPE.DELIMITER && state.token in NAMED_DELIMITERS)) {
             key = state.token
             getToken(state)
@@ -1691,7 +1663,10 @@ export const createParse = /* #__PURE__ */ factory(name, dependencies, ({
       numberStr = state.token
       getToken(state)
 
-      return new ConstantNode(numeric(numberStr, config.number))
+      const numericType = safeNumberType(numberStr, config)
+      const value = numeric(numberStr, numericType)
+
+      return new ConstantNode(value)
     }
 
     return parseParentheses(state)
